@@ -1,0 +1,336 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <MD_Parola.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES 4
+#define CS_PIN 5
+#define CLK_PIN 18
+#define DATA_PIN 23
+MD_Parola matrix = MD_Parola(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
+
+#define BUZZER_PIN 4
+#define NUM_TARGETS 5
+
+uint8_t targetAddresses[NUM_TARGETS][6] = {
+  {0x00,0x4B,0x12,0x9A,0xA8,0x80}, // Target 0
+  {0x00,0x4B,0x12,0x9B,0xD4,0x0C}, // Target 1
+  {0x00,0x4B,0x12,0x9A,0xE2,0x04},  // Target 2
+  {0x00,0x4B,0x12,0x9A,0x7E,0x74},  // Target 3
+  {0x00,0x4B,0x12,0x9B,0x96,0x80}  // Target 4
+
+};
+
+// -----------------------------
+// Message structures
+// -----------------------------
+typedef struct __attribute__((packed)) {
+  uint8_t targetID;
+  uint8_t cmd;  // 0=OFF, 1=SET_COLOR
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+} TargetCommand;
+
+typedef struct __attribute__((packed)) {
+  uint8_t targetID;
+  uint8_t type; // 0=ACK, 1=BUTTON_PRESS
+} TargetResponse;
+
+// -----------------------------
+// Game state
+// -----------------------------
+enum GameState { IDLE, RUNNING, BETWEEN_ROUNDS, GAME_OVER };
+GameState state = IDLE;
+
+uint8_t currentTarget = 0xFF;
+uint8_t rounds = 10;
+uint8_t currentRound = 0;
+unsigned long startTime = 0, endTime = 0, nextActionAt = 0;
+
+// Target availability
+bool targetEnabled[NUM_TARGETS] = { true, true, true, true, true };
+
+// Time when game ended (for lockout)
+unsigned long gameOverAt = 0;
+const unsigned long GAME_OVER_LOCKOUT_MS = 10000; // 10 seconds
+
+// -----------------------------
+// Event + ACK tracking
+// -----------------------------
+volatile bool eventPending = false;
+volatile uint8_t eventType = 0xFF;
+volatile uint8_t eventTarget = 0xFF;
+
+bool awaitingAck = false;
+uint8_t ackTarget = 0xFF;
+unsigned long ackSentAt = 0;
+uint8_t ackRetries = 0;
+const uint16_t ACK_TIMEOUT = 100;  // ms
+const uint8_t MAX_RETRIES = 3;
+
+// Store last sent command (for resends)
+TargetCommand lastCmd;
+
+// -----------------------------
+// Display helpers
+// -----------------------------
+void showMessage(const char* msg) {
+  matrix.displayClear();
+  matrix.displayText(msg, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+  matrix.displayAnimate();
+}
+
+void showTargetsLeft() {
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%u left", rounds - currentRound);
+  showMessage(buf);
+}
+
+// -----------------------------
+// Command sending + reliability
+// -----------------------------
+void sendCmd(uint8_t id, uint8_t cmd, uint8_t r, uint8_t g, uint8_t b) {
+  lastCmd.targetID = id;
+  lastCmd.cmd = cmd;
+  lastCmd.r = r;
+  lastCmd.g = g;
+  lastCmd.b = b;
+
+  esp_err_t res = esp_now_send(targetAddresses[id], (uint8_t*)&lastCmd, sizeof(lastCmd));
+  Serial.printf("📤 Cmd→T%u [%u,%u,%u,%u] res=%d\n", id, cmd, r, g, b, res);
+
+  awaitingAck = true;
+  ackTarget = id;
+  ackSentAt = millis();
+  ackRetries = 0;
+}
+
+// -----------------------------
+// Retry logic (non-blocking)
+// -----------------------------
+void handleAckTimeout() {
+  if (!awaitingAck) return;
+
+  if (millis() - ackSentAt >= ACK_TIMEOUT) {
+    ackRetries++;
+    if (ackRetries < MAX_RETRIES) {
+      Serial.printf("⚠️ Retry %u for Target %u\n", ackRetries, ackTarget);
+      ackSentAt = millis();
+      // Resend the exact last command
+      esp_now_send(targetAddresses[ackTarget], (uint8_t*)&lastCmd, sizeof(lastCmd));
+    } else {
+      Serial.printf("❌ Target %u no ACK after %u tries\n", ackTarget, MAX_RETRIES);
+      awaitingAck = false;
+
+      // Mark target as disabled for remainder of game
+      if (ackTarget < NUM_TARGETS) {
+        targetEnabled[ackTarget] = false;
+      }
+
+      // Show error on the display
+      char errMsg[8];
+      snprintf(errMsg, sizeof(errMsg), "ERR T%u", ackTarget);
+      showMessage(errMsg);
+
+      // If we were trying to play a round, move on to the next one
+      if (state == RUNNING || state == BETWEEN_ROUNDS) {
+        state = BETWEEN_ROUNDS;
+        nextActionAt = millis() + 400;
+      }
+    }
+  }
+}
+
+// -----------------------------
+// Game logic
+// -----------------------------
+void buzz(uint16_t ms) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(ms);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void pickAndActivate() {
+  // Build list of enabled targets
+  uint8_t candidates[NUM_TARGETS];
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < NUM_TARGETS; i++) {
+    if (targetEnabled[i]) {
+      candidates[count++] = i;
+    }
+  }
+
+  if (count == 0) {
+    showMessage("NO TGT");
+    Serial.println("❌ No enabled targets remaining");
+    state = GAME_OVER;
+    gameOverAt = millis();  // ensure lockout if we hit this case
+    return;
+  }
+
+  uint8_t idx = random(count);
+  currentTarget = candidates[idx];
+
+  // Turn selected target blue (active)
+  sendCmd(currentTarget, 1, 0, 0, 255);
+}
+
+void startGame() {
+  state = BETWEEN_ROUNDS;
+  currentRound = 0;
+  startTime = 0;
+  endTime = 0;
+  nextActionAt = millis() + 500;
+
+  // Re-enable all targets at start of game
+  for (uint8_t i = 0; i < NUM_TARGETS; i++) {
+    targetEnabled[i] = true;
+  }
+
+  buzz(300);
+  showMessage("Start");
+  Serial.println("🎮 Game started");
+}
+
+void finishGame() {
+  state = GAME_OVER;
+  endTime = millis();
+  float s = (endTime - startTime) / 1000.0f;
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%.2f", s);
+  showMessage(buf);
+  buzz(500);
+  Serial.printf("🏁 Game over: %.2fs\n", s);
+
+  // Record when game ended for lockout
+  gameOverAt = millis();
+}
+
+// -----------------------------
+// ESP-NOW receive callback
+// -----------------------------
+void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
+  if (len != sizeof(TargetResponse)) return;
+
+  TargetResponse r;
+  memcpy(&r, data, sizeof(r));
+
+  if (r.type == 0) {
+    // ACK
+    if (awaitingAck && r.targetID == ackTarget) {
+      awaitingAck = false;
+      Serial.printf("✅ Ack received from Target %u\n", r.targetID);
+    }
+    return;  // ACK handled; no event
+  }
+
+  // Button press event
+  if (r.type == 1) {
+    eventPending = true;
+    eventType = r.type;
+    eventTarget = r.targetID;
+  }
+}
+
+// -----------------------------
+// Setup
+// -----------------------------
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  matrix.begin();
+  matrix.setIntensity(2);
+  matrix.displayClear();
+  showMessage("Ready");
+
+  if (esp_now_init() != ESP_OK) {
+    showMessage("ESP NOW Err");
+    Serial.println("❌ ESP-NOW init failed");
+    return;
+  }
+  esp_now_register_recv_cb(onReceive);
+
+  for (int i = 0; i < NUM_TARGETS; i++) {
+    esp_now_peer_info_t p = {};
+    memcpy(p.peer_addr, targetAddresses[i], 6);
+    p.channel = 0;
+    p.encrypt = false;
+    esp_now_add_peer(&p);
+  }
+
+  randomSeed(analogRead(0));
+  Serial.println("✅ Controller ready");
+}
+
+// -----------------------------
+// Main loop
+// -----------------------------
+void loop() {
+  matrix.displayAnimate();
+  handleAckTimeout(); // check for missed ACKs
+
+  // Only start a new round when we're between rounds and not waiting for ACK
+  if (state == BETWEEN_ROUNDS && millis() >= nextActionAt && !awaitingAck) {
+    pickAndActivate();
+    if (state != GAME_OVER) {
+      state = RUNNING;
+      showTargetsLeft();
+    }
+  }
+
+  if (eventPending) {
+    noInterrupts();
+    uint8_t t = eventTarget;
+    uint8_t e = eventType;
+    eventPending = false;
+    interrupts();
+
+    if (e == 1) { // Button press
+      // 🔒 Lockout logic after game over
+      if (state == GAME_OVER) {
+        unsigned long now = millis();
+        if (now - gameOverAt < GAME_OVER_LOCKOUT_MS) {
+          Serial.println("⏱ Press ignored during post-game lockout");
+          return;  // ignore presses during lockout
+        } else {
+          // Lockout expired, allow new game
+          startGame();
+          return;
+        }
+      }
+
+      if (state == IDLE) {
+        startGame();
+        return;
+      }
+
+      if (state == RUNNING && t == currentTarget && targetEnabled[t]) {
+        if (currentRound == 0) startTime = millis();
+        currentRound++;
+
+        // Flash red for 0.5s then off
+        sendCmd(t, 1, 255, 0, 0);  // Red
+        delay(500);
+        sendCmd(t, 0, 0, 0, 0);    // Off
+
+        if (currentRound < rounds) {
+          state = BETWEEN_ROUNDS;
+          nextActionAt = millis() + 400;
+        } else {
+          finishGame();
+        }
+      } else {
+        Serial.printf("Ignored press from T%u (current %u, enabled=%d)\n",
+                      t, currentTarget, targetEnabled[t] ? 1 : 0);
+      }
+    }
+  }
+}
