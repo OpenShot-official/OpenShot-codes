@@ -1,0 +1,382 @@
+#include <Arduino.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include "esp_wifi.h"
+#include "esp_sleep.h"
+
+// ===================================================
+// --- Wireless Target + Battery Monitor (Combined) ---
+// Battery behavior:
+//   - VBAT <= 3.30V  -> pulse RED, button disabled, ignore colour cmds (still ACK)
+//   - VBAT <  3.20V  -> deep sleep (min power), latched
+// Hysteresis:
+//   - Exit pulse only when VBAT >= 3.35V
+//   - Deep sleep latches; on periodic wake, it only resumes if VBAT >= 3.30V
+// ===================================================
+
+
+// -----------------------------
+// Pins
+// -----------------------------
+#define R_PIN 14
+#define G_PIN 12
+#define B_PIN 13
+#define BUTTON_PIN 4
+#define DEBOUNCE_MS 50
+
+// Battery ADC pin
+const int BAT_ADC_PIN = 34;   // ADC1 pin
+
+// -----------------------------
+// Voltage divider
+// -----------------------------
+const float R1 = 100000.0f;  // BAT+ -> ADC
+const float R2 = 100000.0f;  // ADC -> GND
+
+// -----------------------------
+// Battery thresholds + hysteresis
+// -----------------------------
+const float VBAT_PULSE_ENTER = 3.30f; // enter pulse at or below
+const float VBAT_PULSE_EXIT  = 3.35f; // exit pulse only above this
+
+const float VBAT_SLEEP_ENTER = 3.20f; // enter sleep below this
+const float VBAT_WAKE_MIN    = 3.30f; // on wake, only resume if above this
+
+// Battery read interval
+const unsigned long BAT_READ_INTERVAL_MS = 1000;
+
+// Deep sleep re-check interval (low power, allows recovery if charged)
+const uint64_t SLEEP_RECHECK_US = 5ULL * 60ULL * 1000000ULL; // 5 minutes
+
+// Smoothing (EMA): higher alpha = reacts faster, lower = smoother
+// 0.15 is a good balance for 1s updates
+const float VBAT_EMA_ALPHA = 0.15f;
+
+// -----------------------------
+// Target ID & controller MAC
+// -----------------------------
+#define TARGET_ID 6   // ⚠️ Change per board
+uint8_t controllerAddress[] = {0x44, 0x1D, 0x64, 0xF5, 0x5F, 0xD8};
+
+// -----------------------------
+// Message structures
+// -----------------------------
+typedef struct __attribute__((packed)) {
+  uint8_t targetID;
+  uint8_t cmd;  // 0=OFF, 1=SET_COLOR
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+} TargetCommand;
+
+typedef struct __attribute__((packed)) {
+  uint8_t targetID;
+  uint8_t type; // 0=ACK, 1=BUTTON_PRESS
+} TargetResponse;
+
+// -----------------------------
+// State
+// -----------------------------
+unsigned long lastDebounce = 0;
+
+enum BatteryState : uint8_t {
+  BAT_NORMAL = 0,
+  BAT_PULSE  = 1,
+  BAT_SLEEP  = 2
+};
+
+BatteryState batState = BAT_NORMAL;
+
+// raw + filtered VBAT
+float vbatRaw = 0.0f;
+float vbatFilt = 0.0f;
+bool  emaInit = false;
+
+unsigned long lastBatRead = 0;
+
+// Latch: once we decide sleep, we go immediately
+bool sleepLatched = false;
+
+// -----------------------------
+// LED PWM (for pulsing)
+// -----------------------------
+static const int LEDC_FREQ = 5000;
+static const int LEDC_RES  = 8;     // 0..255
+static const int CH_R = 0;
+static const int CH_G = 1;
+static const int CH_B = 2;
+
+// Pulse animation
+unsigned long pulseStartMs = 0;
+static const unsigned long PULSE_PERIOD_MS = 1400; // breathing speed
+
+// -----------------------------
+// Helpers
+// -----------------------------
+void setRGB(uint8_t r, uint8_t g, uint8_t b) {
+  ledcWrite(CH_R, r);
+  ledcWrite(CH_G, g);
+  ledcWrite(CH_B, b);
+}
+
+void allOff() { setRGB(0, 0, 0); }
+
+void sendResponse(uint8_t type) {
+  TargetResponse res = { TARGET_ID, type };
+  esp_err_t result = esp_now_send(controllerAddress, (uint8_t *)&res, sizeof(res));
+  Serial.printf("📤 Sent response type %u from Target %u (res=%d)\n", type, TARGET_ID, result);
+}
+
+float readBatteryVoltageRaw() {
+  const int SAMPLES = 8;
+  uint32_t sumMv = 0;
+
+  for (int i = 0; i < SAMPLES; i++) {
+    sumMv += (uint32_t)analogReadMilliVolts(BAT_ADC_PIN);
+    delay(2);
+  }
+
+  float mv_pin = (float)sumMv / (float)SAMPLES;
+  float vbat = (mv_pin / 1000.0f) * ((R1 + R2) / R2);
+  return vbat;
+}
+
+float updateEma(float raw) {
+  if (!emaInit) {
+    vbatFilt = raw;
+    emaInit = true;
+  } else {
+    vbatFilt = (VBAT_EMA_ALPHA * raw) + ((1.0f - VBAT_EMA_ALPHA) * vbatFilt);
+  }
+  return vbatFilt;
+}
+
+void applyBatteryStateMachine(float v) {
+  // Latched sleep always wins
+  if (sleepLatched) {
+    batState = BAT_SLEEP;
+    return;
+  }
+
+  // Enter sleep if below hard threshold
+  if (v < VBAT_SLEEP_ENTER) {
+    batState = BAT_SLEEP;
+    sleepLatched = true; // latch immediately so we don't bounce
+    return;
+  }
+
+  // Pulse mode hysteresis
+  if (batState == BAT_PULSE) {
+    // Only exit pulse if we recover above exit threshold
+    if (v >= VBAT_PULSE_EXIT) {
+      batState = BAT_NORMAL;
+    }
+  } else {
+    // From normal -> pulse when below enter threshold
+    if (v <= VBAT_PULSE_ENTER) {
+      batState = BAT_PULSE;
+      pulseStartMs = millis();
+    } else {
+      batState = BAT_NORMAL;
+    }
+  }
+}
+
+void doRedPulse() {
+  unsigned long now = millis();
+  unsigned long t = (now - pulseStartMs) % PULSE_PERIOD_MS;
+
+  uint16_t half = PULSE_PERIOD_MS / 2;
+  uint8_t level;
+  if (t < half) {
+    level = (uint8_t)((t * 255UL) / half);
+  } else {
+    unsigned long t2 = t - half;
+    level = (uint8_t)(255 - ((t2 * 255UL) / half));
+  }
+
+  setRGB(level, 0, 0);
+}
+
+void enterLowPowerSleep() {
+  Serial.println("🛑 Battery low → deep sleep (latched).");
+
+  allOff();
+
+  // Stop ESP-NOW + WiFi
+  esp_now_deinit();
+  esp_wifi_stop();
+  WiFi.mode(WIFI_OFF);
+
+  // Low leakage GPIO
+  pinMode(R_PIN, INPUT);
+  pinMode(G_PIN, INPUT);
+  pinMode(B_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT);   // no pullups
+  pinMode(BAT_ADC_PIN, INPUT);
+
+  // Wake periodically to see if charge has recovered
+  esp_sleep_enable_timer_wakeup(SLEEP_RECHECK_US);
+
+  delay(50);
+  esp_deep_sleep_start();
+}
+
+// -----------------------------
+// ESP-NOW receive callback
+// -----------------------------
+void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
+  if (len != sizeof(TargetCommand)) return;
+
+  TargetCommand cmd;
+  memcpy(&cmd, data, sizeof(cmd));
+  if (cmd.targetID != TARGET_ID) return;
+
+  // In pulse mode, ignore colour changes (still ACK)
+  if (batState == BAT_PULSE) {
+    Serial.printf("🔋 LOW: ignoring colour cmd, pulsing red. Target %u\n", TARGET_ID);
+    sendResponse(0);
+    return;
+  }
+
+  // In sleep state we won't be here (WiFi will be off), but keep safe
+  if (batState == BAT_SLEEP) {
+    sendResponse(0);
+    return;
+  }
+
+  // Normal behaviour
+  if (cmd.cmd == 0) {
+    allOff();
+    Serial.printf("🔇 Target %u OFF\n", TARGET_ID);
+  } else if (cmd.cmd == 1) {
+    uint8_t rr = cmd.r ? 255 : 0;
+    uint8_t gg = cmd.g ? 255 : 0;
+    uint8_t bb = cmd.b ? 255 : 0;
+    setRGB(rr, gg, bb);
+    Serial.printf("🎨 Target %u RGB(%u,%u,%u)\n", TARGET_ID, rr, gg, bb);
+  }
+
+  sendResponse(0);
+}
+
+// -----------------------------
+// Setup
+// -----------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  // LED PWM setup (pins unchanged)
+  ledcSetup(CH_R, LEDC_FREQ, LEDC_RES);
+  ledcSetup(CH_G, LEDC_FREQ, LEDC_RES);
+  ledcSetup(CH_B, LEDC_FREQ, LEDC_RES);
+
+  ledcAttachPin(R_PIN, CH_R);
+  ledcAttachPin(G_PIN, CH_G);
+  ledcAttachPin(B_PIN, CH_B);
+
+  allOff();
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Battery ADC setup
+  analogReadResolution(12);
+  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+
+  // Read battery at boot
+  vbatRaw = readBatteryVoltageRaw();
+  vbatFilt = vbatRaw;
+  emaInit = true;
+
+  Serial.printf("🔋 Boot battery raw: %.3f V\n", vbatRaw);
+
+  // If we woke from deep sleep, only resume if recovered enough
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  if (cause != ESP_SLEEP_WAKEUP_UNDEFINED && cause != ESP_SLEEP_WAKEUP_EXT0 && cause != ESP_SLEEP_WAKEUP_EXT1) {
+    // timer wake etc.
+    Serial.printf("⏰ Wake cause: %d\n", (int)cause);
+  }
+
+  // If VBAT is still low, go right back to sleep (prevents bouncing after wake)
+  if (vbatFilt < VBAT_WAKE_MIN) {
+    sleepLatched = true;
+    enterLowPowerSleep();
+  }
+
+  // Decide state now
+  applyBatteryStateMachine(vbatFilt);
+  if (batState == BAT_SLEEP) {
+    enterLowPowerSleep();
+  }
+
+  // ESP-NOW init
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ ESP-NOW init failed");
+    return;
+  }
+
+  esp_now_register_recv_cb(onReceive);
+
+  esp_now_peer_info_t p = {};
+  memcpy(p.peer_addr, controllerAddress, 6);
+  p.channel = 0;
+  p.encrypt = false;
+  esp_now_add_peer(&p);
+
+  pulseStartMs = millis();
+  Serial.printf("✅ Target %u ready\n", TARGET_ID);
+}
+
+// -----------------------------
+// Loop
+// -----------------------------
+void loop() {
+  unsigned long now = millis();
+
+  // Periodic battery check (smoothed)
+  if (now - lastBatRead >= BAT_READ_INTERVAL_MS) {
+    lastBatRead = now;
+
+    vbatRaw = readBatteryVoltageRaw();
+    float prevFilt = vbatFilt;
+    vbatFilt = updateEma(vbatRaw);
+
+    BatteryState prevState = batState;
+    applyBatteryStateMachine(vbatFilt);
+
+    Serial.printf("🔋 VBAT raw=%.3f V  filt=%.3f V  state=%u\n",
+                  vbatRaw, vbatFilt, (unsigned)batState);
+
+    if (batState == BAT_SLEEP) {
+      enterLowPowerSleep(); // never returns
+    }
+
+    if (prevState != batState && batState == BAT_PULSE) {
+      pulseStartMs = now;
+    }
+
+    if (prevState == BAT_PULSE && batState == BAT_NORMAL) {
+      allOff(); // wait for controller command
+    }
+
+    (void)prevFilt;
+  }
+
+  // Low battery pulse: override LED + disable button + ignore game logic
+  if (batState == BAT_PULSE) {
+    doRedPulse();
+    delay(5);
+    return;
+  }
+
+  // Normal mode: handle button presses
+  if (digitalRead(BUTTON_PIN) == LOW && (now - lastDebounce > DEBOUNCE_MS)) {
+    sendResponse(1);
+    lastDebounce = now;
+    delay(200);
+  }
+}
